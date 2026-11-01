@@ -16,6 +16,7 @@ package transport
 
 import (
 	"fmt"
+	"math"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -295,6 +296,19 @@ func (c *HostSender) Recv(ctx context.Context, data [][]byte, args RecvArgs) (Re
 	// N.B. Unix sockets don't have a receive buffer, the send buffer
 	// serves both purposes.
 	//
+	// Datagram and seqpacket reads keep the send buffer limit. Stream
+	// sockets don't preserve message boundaries and the host may queue more
+	// than the send buffer size, so read as much as fits in data, as Linux
+	// does: readers using edge-triggered notifications take a short read to
+	// mean that the socket is drained. If data needs more iovecs than the
+	// host accepts, fdReadVec reads into an intermediate buffer, which stays
+	// bounded by the send buffer size, so such stream reads can still be
+	// short.
+	maxlen := c.RecvMaxQueueSize()
+	if c.stype == linux.SOCK_STREAM && !needsIntermediate(data) {
+		maxlen = math.MaxInt64
+	}
+
 	// We ignore args.Creds because we don't translate sandbox socket options to
 	// host socket options, so the fd won't have the SO_PASSCRED option set. By
 	// default, the sentry will always return credentials with PID 0 and UID/GID
@@ -302,7 +316,7 @@ func (c *HostSender) Recv(ctx context.Context, data [][]byte, args RecvArgs) (Re
 	out := RecvOutput{Source: Address{Addr: c.addr}}
 	var err error
 	var controlLen uint64
-	out.RecvLen, out.MsgLen, controlLen, out.ControlTrunc, err = fdReadVec(c.fd, data, []byte(cm), args.Peek, c.RecvMaxQueueSize())
+	out.RecvLen, out.MsgLen, controlLen, out.ControlTrunc, err = fdReadVec(c.fd, data, []byte(cm), args.Peek, maxlen)
 	if out.RecvLen > 0 && err != nil {
 		// We got some data, so all we need to do on error is return
 		// the data that we got. Short reads are fine, no need to
